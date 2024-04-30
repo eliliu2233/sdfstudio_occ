@@ -153,7 +153,7 @@ class LinearMapping:
 class GridMeterMapping:
     def __init__(
         self,
-        nonlinear_mode: Literal["linear_upscale", "linear"] = "linear_upscale",
+        nonlinear_mode: Literal["linear_upscale", "linear", 'unbounded'] = "linear_upscale",
         h_size=[128, 32],
         h_range=[51.2, 28.8],
         h_half=False,
@@ -162,6 +162,7 @@ class GridMeterMapping:
         w_half=False,
         d_size=[20, 10],
         d_range=[-4.0, 4.0, 12.0],
+        contracted_ratio=0.666667,
     ) -> None:
         self.nonlinear_mode = nonlinear_mode
         if nonlinear_mode == "linear_upscale":
@@ -176,6 +177,14 @@ class GridMeterMapping:
             self.size_h = self.mapping.h_tot_len
             self.size_w = self.mapping.w_tot_len
             self.size_d = self.mapping.d_tot_len
+        elif nonlinear_mode == 'unbounded':
+            self.mapping = UnboundedMapping(h_size, h_range, w_size, w_range, d_size, d_range, contracted_ratio)
+            self.size_h = self.mapping.h_size
+            self.size_w = self.mapping.w_size
+            self.size_d = self.mapping.d_size
+            self.size_h_sdf = h_size + 1
+            self.size_w_sdf = w_size + 1
+            self.size_d_sdf = d_size + 1
         self.grid2meter = self.mapping.grid2meter
         self.meter2grid = self.mapping.meter2grid
 
@@ -274,3 +283,125 @@ class NonLinearMapping:
             d = d / (self.z_size - 1)
 
         return torch.cat([wh[..., 1:2], wh[..., 0:1], d], dim=-1)
+
+class MeRFMapping:
+    def __init__(
+        self,
+        h_size=[128, 32],
+        h_range=[51.2, 28.8],
+        h_half=False,
+        w_size=[128, 32],
+        w_range=[51.2, 28.8],
+        w_half=False,
+        d_size=[20, 10],
+        d_range=[-4.0, 4.0, 12.0],
+    ):
+        self.h_size = h_size
+        self.h_range = h_range
+        self.h_half = h_half
+
+        self.w_size = w_size
+        self.w_range = w_range
+        self.w_half = w_half
+
+        self.d_size = d_size
+        self.d_range = [d_range[1] - d_range[0], d_range[2] - d_range[1]]
+        self.d_start = d_range[0]
+
+    def grid2meter(self, grid):
+        # grid: [..., (h, w, d)]
+        grid_norm = grid[..., [1,0,2]] / torch.FloatTensor([self.w_size, self.h_size, self.d_size], device=grid.device)
+        grid_norm = (grid_norm - 0.5) * 4
+        
+
+        ## deal with d
+        if d is not None:
+            d_ctr = d
+            d_abs = torch.abs(d_ctr)
+            if self.d_size[1] == 0:
+                z_abs = d_abs / self.d_size[0] * self.d_range[0]
+            else:
+                z_abs = torch.where(
+                    d_abs > self.d_size[0],
+                    self.d_range[0] + (d_abs - self.d_size[0]) / self.d_size[1] * self.d_range[1],
+                    d_abs / self.d_size[0] * self.d_range[0],
+                )
+            z = torch.sign(d_ctr) * z_abs + self.d_start
+
+            return torch.stack([x, y, z], dim=-1)
+        else:
+            return torch.stack([x, y], dim=-1)
+
+    def meter2grid(self, meter, normalize=False):
+        aabb_max = torch.FloatTensor([self.w_range[1], self.h_range[1], self.d_range[1]], device=meter.device)
+        aabb_min = torch.FloatTensor([self.w_range[0], self.h_range[0], self.d_range[0]], device=meter.device)
+        meter_norm = 2 * (x - aabb_min) / (aabb_max - aabb_min) - 1.0 # aabb to [-1,1]
+        mag = torch.linalg.norm(meter_norm, ord=float("inf"), dim=-1, keepdim=True)
+        x = torch.where(mag < 1, meter_norm, (2 - 1 / mag) * (meter_norm / mag))
+        x = x / 4 + 0.5  # [-inf, inf] is at [0, 1]
+        
+        if not normalize:
+            x = x * torch.FloatTensor([self.w_size, self.h_size, self.d_size], device=meter.device)
+
+        return x[...,[1,0,2]] # (w,h,d)-->(h,w,d)
+    
+class UnboundedMapping:
+    def __init__(
+        self,
+        h_size=256,
+        h_range=[-51.2, 51.2],
+        w_size=256,
+        w_range=[-51.2, 51.2],
+        d_size=20,
+        d_range=[-3.0, 5.0],
+        contracted_ratio=0.666667,
+    ):
+        self.occ_size = [h_size, w_size, d_size]
+        self.h_size = round(h_size / contracted_ratio) + 1
+        self.h_range = h_range
+
+        self.w_size = round(w_size / contracted_ratio) + 1
+        self.w_range = w_range
+
+        self.d_size = round(d_size / contracted_ratio) + 1
+        self.d_range = d_range
+        self.contracted_ratio = contracted_ratio
+
+    def grid2meter(self, grid):
+        # grid: [..., (h, w, d)]
+        # Avoid inf
+        torch.clamp_(grid[...,0], 0.5, self.h_size-1.5)
+        torch.clamp_(grid[...,1], 0.5, self.w_size-1.5)
+        torch.clamp_(grid[...,2], 0.05, self.d_size-1.05)
+        aabb_max = torch.FloatTensor([self.w_range[1], self.h_range[1], self.d_range[1]]).to(grid.device)
+        aabb_min = torch.FloatTensor([self.w_range[0], self.h_range[0], self.d_range[0]]).to(grid.device)
+        grid_norm = grid[..., [1,0,2]] / torch.FloatTensor([self.w_size-1, self.h_size-1, self.d_size-1]).to(grid.device)
+        grid_norm = (grid_norm - 0.5) * 2
+        t = self.contracted_ratio / (1 - self.contracted_ratio)
+        xyz_ = grid_norm * (t + 1)
+        xyz_abs = torch.abs(xyz_)
+        xyz_scaled = torch.where(
+            xyz_abs <= t,
+            xyz_,
+            xyz_.sign() * (t - 1.0 + 1.0/(t + 1 - xyz_abs))
+        ) / t
+        xyz_world = 0.5 * (xyz_scaled + 1) * (aabb_max - aabb_min) + aabb_min
+
+        return xyz_world
+
+    def meter2grid(self, meter, normalize=False):
+        aabb_max = torch.FloatTensor([self.w_range[1], self.h_range[1], self.d_range[1]]).to(meter.device)
+        aabb_min = torch.FloatTensor([self.w_range[0], self.h_range[0], self.d_range[0]]).to(meter.device)
+        t = self.contracted_ratio / (1 - self.contracted_ratio)
+        xyz_scaled = (2 * (meter - aabb_min) / (aabb_max - aabb_min) - 1) * t
+        xyz_abs = torch.abs(xyz_scaled)
+        xyz_contracted = torch.where(
+            xyz_abs <= t,
+            xyz_scaled,
+            xyz_scaled.sign() * (1.0 + t - 1.0/(xyz_abs + 1 - t))
+        )
+        xyz_contracted = 0.5 * (xyz_contracted / (t + 1) + 1.0) # range: [0, 1]
+        if not normalize:
+            xyz_contracted = xyz_contracted * torch.FloatTensor([self.w_size-1, self.h_size-1, self.d_size-1]).to(meter.device)
+            
+        return xyz_contracted[...,[1,0,2]] # (w,h,d)-->(h,w,d)

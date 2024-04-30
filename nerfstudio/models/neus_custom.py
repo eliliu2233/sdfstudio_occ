@@ -37,7 +37,7 @@ from nerfstudio.model_components.ray_samplers import NeuSSampler, CustomNeuSSamp
 from nerfstudio.models.base_surface_model import SurfaceModel, SurfaceModelConfig
 from nerfstudio.fields.sdf_custom_field import SDFCustomFieldConfig
 
-from mmengine import MMLogger
+# from mmengine import MMLogger
 
 
 @dataclass
@@ -51,6 +51,8 @@ class NeuSCustomModelConfig(SurfaceModelConfig):
     """Number of importance samples"""
     num_up_sample_steps: int = 4
     """number of up sample step, 1 for simple coarse-to-fine sampling"""
+    num_samples_outside: int = 96
+    """Number of background samples"""
     base_variance: float = 64
     """fixed base variance in NeuS sampler, the inv_s will be base * 2 ** iter during upsample"""
     perturb: bool = True
@@ -90,7 +92,7 @@ class NeuSCustomModel(SurfaceModel):
         super().populate_modules()
 
         print(
-            f"NeuSCustomModel Config: num_samples {self.config.num_samples}, num_samples_importance {self.config.num_samples_importance}, num_up_sample_steps {self.config.num_up_sample_steps}"
+            f"NeuSCustomModel Config: num_samples {self.config.num_samples}, num_samples_importance {self.config.num_samples_importance}, num_up_sample_steps {self.config.num_up_sample_steps}, num_background {self.config.num_samples_outside}"
         )
 
         sampler_class = CustomNeuSSampler if self.config.disp_sampler else NeuSSampler
@@ -193,7 +195,7 @@ class NeuSCustomModel(SurfaceModel):
             )
             self.collider.near_plane = near
             self.collider.scene_box.aabb[:, :2] = aabb_coef * self.aabb[:, :2]
-            logger = MMLogger.get_instance("selfocc")
-            logger.info(f"aabb_annealed! near: {self.collider.near_plane}, aabb: {self.collider.scene_box.aabb}")
+            # logger = MMLogger.get_instance("selfocc")
+            # logger.info(f"aabb_annealed! near: {self.collider.near_plane}, aabb: {self.collider.scene_box.aabb}")
 
         return super().forward(ray_bundle)

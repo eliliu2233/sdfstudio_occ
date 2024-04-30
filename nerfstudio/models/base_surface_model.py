@@ -214,6 +214,9 @@ class SurfaceModel(Model):
             self.renderer_sem = SemanticRenderer()
 
         self.renderer_normal = SemanticRenderer()
+        if self.field.config.estimate_flow:
+            self.renderer_flow = SemanticRenderer()
+            
         # patch warping
         self.patch_warping = PatchWarping(
             patch_size=self.config.patch_size, valid_angle_thres=self.config.patch_warp_angle_thres
@@ -310,8 +313,8 @@ class SurfaceModel(Model):
         # remove the rays that don't intersect with the surface
         # hit = (field_outputs[FieldHeadNames.SDF] > 0.0).any(dim=1) & (field_outputs[FieldHeadNames.SDF] < 0).any(dim=1)
         # depth[~hit] = 10000.0
-
-        normal = self.renderer_normal(semantics=field_outputs[FieldHeadNames.NORMAL], weights=weights)
+        normals = field_outputs[FieldHeadNames.NORMAL]
+        normal = self.renderer_normal(semantics=normals, weights=weights[...,:normals.shape[-2],:])
         normal = F.normalize(normal, p=2, dim=-1)
         accumulation = self.renderer_accumulation(weights=weights)
 
@@ -331,6 +334,8 @@ class SurfaceModel(Model):
             "fars": fars,
         }
 
+        # if FieldHeadNames.FLOW in field_outputs.keys():
+        #     outputs.update(sample_flow=field_outputs[FieldHeadNames.FLOW])
         if self.config.return_sem:
             outputs.update({"sem": sem})
 

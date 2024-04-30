@@ -40,7 +40,7 @@ from nerfstudio.field_components.encodings import (
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.spatial_distortions import SpatialDistortion
 from nerfstudio.fields.base_field import Field, FieldConfig
-
+from nerfstudio.fields import softsplat
 try:
     import tinycudann as tcnn
 except ImportError:
@@ -53,7 +53,7 @@ from .cuda_gridsample_grad2 import cuda_gridsample as cudagrid
 from .mappings import GridMeterMapping
 from .sh_render import SHRender
 from .utils import sample_from_2d_img_feats
-
+from mmcv.cnn.bricks.conv_module import ConvModule
 # class GridMeterMapping:
 #     def __init__(
 #         self,
@@ -309,6 +309,7 @@ class SDFCustomFieldConfig(FieldConfig):
     # z_ranges: List[float] = field(default_factory=lambda: [-5.0, 3.0, 11.0])
     # mlp decoder
     embed_dims: int = 128
+    feat_dims: int = 128
     color_dims: int = 0
     density_layers: int = 2
     sh_deg: int = 2
@@ -316,7 +317,7 @@ class SDFCustomFieldConfig(FieldConfig):
 
     beta_learnable: bool = True
     second_derivative: bool = False
-    tpv: bool = False
+    representation: str = 'tpv'
 
     nbr_gradient_points: int = 128 * 128 * 16
     use_uniform_gradient: bool = False
@@ -326,6 +327,7 @@ class SDFCustomFieldConfig(FieldConfig):
     use_compact_2nd_grad: bool = False
 
     using_2d_img_feats: bool = False
+    estimate_flow: bool = False
 
     return_sem: bool = False
 
@@ -355,20 +357,22 @@ class SDFCustomField(Field):
         # self.z_size = self.config.z_inner + self.config.z_outer + 1
         # self.bev_size = 2 * (self.config.bev_inner + self.config.bev_outer) + 1
         self.mapping = GridMeterMapping(
-            # self.config.bev_inner,
-            # self.config.bev_outer,
-            # self.config.range_inner,
-            # self.config.range_outer,
-            # self.config.nonlinear_mode,
-            # self.config.z_inner,
-            # self.config.z_outer,
-            # self.config.z_ranges,
             **self.config.mapping_args
         )
         self.z_size = self.mapping.size_d
         self.h_size = self.mapping.size_h
         self.w_size = self.mapping.size_w
-
+        try:
+            self.z_sdf, self.h_sdf, self.w_sdf = self.mapping.size_d_sdf, self.mapping.size_h_sdf, self.mapping.size_w_sdf
+        except:
+            self.z_sdf, self.h_sdf, self.w_sdf = self.z_size, self.h_size, self.w_size
+        self.offset_x, self.offset_y, self.offset_z = (self.w_size-self.w_sdf)//2, (self.h_size-self.h_sdf)//2, (self.z_size-self.z_sdf)//2
+        self.volume_pad = nn.ConstantPad3d((self.offset_z, self.offset_z, self.offset_x, self.offset_x, self.offset_y, self.offset_y), 0)
+        # x = torch.linspace(0, self.w_size - 1, self.w_size)
+        # y = torch.linspace(0, self.h_size - 1, self.h_size)
+        # z = torch.linspace(0, self.z_size - 1, self.z_size)
+        # Z, X, Y = torch.meshgrid(z, x, y)
+        # fore_mask = (X>=self.offset_x) & (X<occ_X-self.offset_x) & (Y>=offset_y) & (Y<occ_Y-offset_y) & (Z>=offset_z) & (Z<occ_Z-offset_z)
         self.color_converter = SHRender
         self.sh_deg = self.config.sh_deg
         self.sh_act = self.config.sh_act
@@ -382,11 +386,12 @@ class SDFCustomField(Field):
         # MLP with geometric initialization
         self.density_layers = self.config.density_layers
         self.embed_dims = self.config.embed_dims
+        self.feat_dims = self.config.feat_dims
         self.color_dims = self.config.color_dims
         density_net = []
         for i in range(self.density_layers - 1):
             density_net.extend([nn.Softplus(), nn.Linear(self.embed_dims, self.embed_dims)])
-        if not self.config.tpv:
+        if self.config.representation == 'bev' and not self.config.using_2d_img_feats:
             density_net.extend([nn.Softplus(), nn.Linear(self.embed_dims, (1 + self.color_dims) * self.z_size)])
             nn.init.normal_(
                 density_net[-1].weight[range(0, (1 + self.color_dims) * self.z_size, 1 + self.color_dims)], 0, 0.0001
@@ -402,7 +407,16 @@ class SDFCustomField(Field):
             density_net.extend([nn.Softplus(), nn.Linear(self.embed_dims, 1 + self.color_dims)])
         density_net = nn.Sequential(*density_net)
         self.density_net = density_net
-
+        
+        background_net = []
+        for i in range(self.density_layers - 1):
+            background_net.extend([nn.Softplus(), nn.Linear(self.embed_dims, self.embed_dims)])
+        background_net.extend([nn.Softplus(), nn.Linear(self.embed_dims, 1 + self.color_dims)])
+        background_net = nn.Sequential(*background_net)
+        self.background_net = background_net
+        
+        self.conv = ConvModule(self.feat_dims ,self.embed_dims,kernel_size=1,stride=1,padding=1,bias=False,conv_cfg=dict(type='Conv2d'),
+                                norm_cfg=dict(type='BN', ), act_cfg=dict(type='ReLU',inplace=True))
         # laplace function for transform sdf to density from VolSDF
         # self.laplace_density = LaplaceDensity(init_val=self.config.beta_init)
         self.laplace_density = nn.Identity()
@@ -425,14 +439,23 @@ class SDFCustomField(Field):
             assert not self.config.calculate_online
             self.pad = nn.ReplicationPad3d(1)
 
+        if self.config.estimate_flow:
+            flow_net = []
+            flow_net.extend([nn.Linear(self.embed_dims, self.embed_dims), nn.Softplus()])
+            flow_net.extend([nn.Linear(self.embed_dims, self.embed_dims), nn.Softplus()])
+            flow_net.extend([nn.Linear(self.embed_dims, 2)])
+            nn.init.normal_(flow_net[-1].weight.data, 0., 1e-2)
+            nn.init.constant_(flow_net[-1].bias.data, 0.)
+            self.flow_net = nn.Sequential(*flow_net)
+            
         if self.config.using_2d_img_feats:
             assert not self.config.calculate_online
-            assert self.config.tpv
+            assert self.config.representation in ['bev', 'tpv', 'volume']
             grid_coords = torch.stack(
                 [
-                    torch.arange(self.h_size)[:, None, None].expand(-1, self.w_size, self.z_size),
-                    torch.arange(self.w_size)[None, :, None].expand(self.h_size, -1, self.z_size),
-                    torch.arange(self.z_size)[None, None, :].expand(self.h_size, self.w_size, -1),
+                    torch.arange(self.h_size, dtype=torch.float)[:, None, None].expand(-1, self.w_size, self.z_size),
+                    torch.arange(self.w_size, dtype=torch.float)[None, :, None].expand(self.h_size, -1, self.z_size),
+                    torch.arange(self.z_size, dtype=torch.float)[None, None, :].expand(self.h_size, self.w_size, -1),
                 ],
                 dim=-1,
             ).flatten(0, 2)
@@ -443,9 +466,10 @@ class SDFCustomField(Field):
             from mmdet3d.models.necks import SECONDFPN
 
             self.img_skip_model = SECONDFPN(
-                in_channels=[self.embed_dims] * 4,
-                out_channels=[self.embed_dims // 4] * 4,
+                in_channels=[self.feat_dims] * 4,
+                out_channels=[self.embed_dims] * 4,
                 upsample_strides=[1, 2, 4, 8],
+                final_conv_feature_dim=self.embed_dims
             )
 
     def set_cos_anneal_ratio(self, anneal: float) -> None:
@@ -463,6 +487,7 @@ class SDFCustomField(Field):
         img_feats=None,
         img_metas=None,
     ):
+        self.density_color_bg = None
         if self.config.using_2d_img_feats:
             assert img_feats is not None and img_metas is not None
             bs, num_cams = img_feats[0].shape[0:2]
@@ -472,29 +497,84 @@ class SDFCustomField(Field):
             img_feats_3d = sample_from_2d_img_feats(img_feats, img_metas, self.sampling_points_2d)
             img_feats_3d = img_feats_3d.unflatten(1, [self.h_size, self.w_size, self.z_size])
         if self.config.calculate_online:
-            self.density_color = torch.cat(bev, dim=1) if self.config.tpv else bev.clone()
+            self.density_color = torch.cat(bev, dim=1) if self.config.representation == 'tpv' else bev.clone()
             return
-        if not self.config.tpv:
+        if self.config.representation == 'bev':
             assert bev.dim() == 3
-            bev = bev.unflatten(1, (self.h_size, self.w_size))
-            density_color = self.density_net(bev).reshape(*bev.shape[:-1], self.z_size, -1)
-            density_color = density_color.permute(0, 4, 1, 2, 3)  # bs, C, h, w, d
-        else:
-            tpv_hw, tpv_zh, tpv_wz = bev
-            tpv_hw = tpv_hw.reshape(-1, self.h_size, self.w_size, 1, self.embed_dims)
-            tpv_hw = tpv_hw.expand(-1, -1, -1, self.z_size, -1)
+            device = bev.device
+            bs = bev.size(0)
+            bev = bev.unflatten(1, (self.h_sdf-1, self.w_sdf-1)).permute(0,3,1,2)
+            # bev = self.conv(bev)
+            x = torch.linspace(-1, 1, self.w_sdf)
+            y = torch.linspace(-1, 1, self.h_sdf)
+            Y, X = torch.meshgrid(y, x)
+            vertices = torch.stack([X, Y], dim=-1).to(device)
+            real_size = torch.FloatTensor([self.w_sdf-1, self.h_sdf-1]).to(device)
+            verts_norm = vertices * real_size/(real_size-1)
+            bev = cudagrid.grid_sample_2d(bev, verts_norm[None,...].repeat(bs,1,1,1), padding_mode='border', align_corners=True).permute(0,2,3,1)
+            if self.config.using_2d_img_feats:
+                volume = bev.unsqueeze(3) + img_feats_3d[:,self.offset_y:self.h_size-self.offset_y,self.offset_x:self.w_size-self.offset_x,self.offset_z:self.z_size-self.offset_z,:]
+                self.density_color_bg = self.background_net(img_feats_3d).permute(0, 4, 1, 2, 3)
+                density_color = self.density_net(volume).permute(0, 4, 1, 2, 3)
+            else:
+                density_color = self.density_net(bev).reshape(*bev.shape[:-1], self.z_size, -1)
+                density_color = density_color.permute(0, 4, 1, 2, 3)  # bs, C, h, w, d
+        elif self.config.representation == 'tpv':
+            if isinstance(bev, list):
+                tpv_hw, tpv_zh, tpv_wz = bev
+                tpv_hw = tpv_hw.reshape(-1, self.h_size, self.w_size, 1, self.embed_dims)
+                tpv_hw = tpv_hw.expand(-1, -1, -1, self.z_size, -1)
 
-            tpv_zh = tpv_zh.reshape(-1, self.z_size, self.h_size, 1, self.embed_dims).permute(0, 2, 3, 1, 4)
-            tpv_zh = tpv_zh.expand(-1, -1, self.w_size, -1, -1)
+                tpv_zh = tpv_zh.reshape(-1, self.z_size, self.h_size, 1, self.embed_dims).permute(0, 2, 3, 1, 4)
+                tpv_zh = tpv_zh.expand(-1, -1, self.w_size, -1, -1)
 
-            tpv_wz = tpv_wz.reshape(-1, self.w_size, self.z_size, 1, self.embed_dims).permute(0, 3, 1, 2, 4)
-            tpv_wz = tpv_wz.expand(-1, self.h_size, -1, -1, -1)
+                tpv_wz = tpv_wz.reshape(-1, self.w_size, self.z_size, 1, self.embed_dims).permute(0, 3, 1, 2, 4)
+                tpv_wz = tpv_wz.expand(-1, self.h_size, -1, -1, -1)
 
-            tpv = tpv_hw + tpv_zh + tpv_wz
+                tpv = tpv_hw + tpv_zh + tpv_wz
+            else:
+                tpv = bev
+            bs, volume_h, volume_w, volume_z, dim = tpv.size()
+            device = tpv.device
+            if self.w_sdf==volume_w+1 and self.h_sdf==volume_h+1 and self.z_sdf==volume_z+1:
+                x = torch.linspace(-1, 1, self.w_sdf)
+                y = torch.linspace(-1, 1, self.h_sdf)
+                z = torch.linspace(-1, 1, self.z_sdf)
+                Y, X, Z = torch.meshgrid(y, x, z)
+                vertices = torch.stack([Z, X, Y], dim=-1).to(device)
+                real_size = torch.FloatTensor([volume_z, volume_w, volume_h]).to(device)
+                verts_norm = vertices * real_size/(real_size-1)
+                tpv = cudagrid.grid_sample_3d(tpv.permute(0,4,1,2,3), verts_norm[None,...].repeat(bs,1,1,1,1), padding_mode='border', align_corners=True).permute(0,2,3,4,1)
             ## TODO: temporarily using addition to fuse
             if self.config.using_2d_img_feats:
                 tpv = tpv + img_feats_3d
             density_color = self.density_net(tpv).permute(0, 4, 1, 2, 3)
+            if self.config.estimate_flow:
+                # next_time = [img_metas[i].get('next_time', 0.5) for i in range(len(img_metas))] if self.training else [0.2]*len(img_metas)
+                # next_time = torch.tensor(next_time,dtype=tpv.dtype, device=tpv.device)[:,None,None,None,None].expand(-1, self.h_sdf, self.w_sdf, self.z_sdf,-1)
+                # # only support bs=1 now
+                # self.fwd_flow = self.flow_net(torch.cat((tpv,next_time),dim=-1))
+                # self.fwd_flow = self.fwd_flow.permute(0, 4, 1, 2, 3)
+                # prev_time = torch.tensor([img_metas[i].get('prev_time', -0.5) for i in range(len(img_metas))],dtype=tpv.dtype, device=tpv.device)[:,None,None,None,None].expand(-1, self.h_sdf, self.w_sdf, self.z_sdf,-1)
+                # self.bwd_flow = self.flow_net(torch.cat((tpv,prev_time),dim=-1))
+                # self.bwd_flow = self.bwd_flow.permute(0, 4, 1, 2, 3)
+                self.fwd_flow = self.flow_net(tpv).permute(0, 4, 1, 2, 3)
+        elif self.config.representation == 'volume':
+            bs, volume_h, volume_w, volume_z, dim = bev.size()
+            device = bev.device
+            x = torch.linspace(-1, 1, volume_w+1)
+            y = torch.linspace(-1, 1, volume_h+1)
+            z = torch.linspace(-1, 1, volume_z+1)
+            Y, X, Z = torch.meshgrid(y, x, z)
+            vertices = torch.stack([Z, X, Y], dim=-1).to(device)
+            real_size = torch.FloatTensor([volume_z, volume_w, volume_h]).to(device)
+            verts_norm = vertices * real_size/(real_size-1)
+            volume = cudagrid.grid_sample_3d(bev.permute(0,4,1,2,3), verts_norm[None,...].repeat(bs,1,1,1,1), padding_mode='border', align_corners=True).permute(0,2,3,4,1)
+            if self.config.using_2d_img_feats:
+                volume = volume + img_feats_3d[:,self.offset_y:self.h_size-self.offset_y+1,self.offset_x:self.w_size-self.offset_x+1,self.offset_z:self.z_size-self.offset_z+1,:]
+                self.density_color_bg = self.background_net(img_feats_3d).permute(0, 4, 1, 2, 3)
+            density_color = self.density_net(volume).permute(0, 4, 1, 2, 3)    
+            
         self.density_color = density_color  # .to(dtype)
 
         if self.config.sample_gradient:
@@ -556,7 +636,7 @@ class SDFCustomField(Field):
         grid = self.mapping.meter2grid(inputs, True)
         grid = grid[None, None, ...] * 2 - 1
 
-        if self.config.tpv:
+        if self.config.representation == 'tpv':
             tpv_hw, tpv_zh, tpv_wz = self.density_color.split(
                 [self.h_size * self.w_size, self.z_size * self.h_size, self.w_size * self.z_size], dim=1
             )
@@ -581,7 +661,7 @@ class SDFCustomField(Field):
             tpv = tpv_hw + tpv_zh + tpv_wz
             density_color = self.density_net(tpv)
             return density_color
-        else:
+        elif self.config.representation == 'bev':
             bev = self.density_color
             bev = bev.unflatten(1, (self.h_size, self.w_size)).permute(0, 3, 1, 2)  # bs, c, h, w
             bev = (
@@ -598,13 +678,28 @@ class SDFCustomField(Field):
             ).reshape(
                 inputs.shape[0], -1
             )  # n, c
+        elif self.config.representation == 'volume':
+            volume = self.density_color
+            bs, volume_h, volume_w, volume_z, dim = bev.size()
+            device = bev.device
+            x = torch.linspace(-1, 1, self.w_size)
+            y = torch.linspace(-1, 1, self.h_size)
+            z = torch.linspace(-1, 1, self.z_size)
+            Y, X, Z = torch.meshgrid(y, x, z)
+            vertices = torch.stack([Z, X, Y], dim=-1).to(device)
+            real_size = torch.FloatTensor([volume_z, volume_w, volume_h]).to(device)
+            verts_norm = vertices * real_size/(real_size-1)
+            volume = cudagrid.grid_sample_3d(bev.permute(0,4,1,2,3), verts_norm[None,...].repeat(bs,1,1,1,1), padding_mode='border', align_corners=True)
+            
+            volume_feats = cudagrid.grid_sample_3d(volume, grid[...,[2,1,0]], align_corners=True, padding_mode="border").permute(0,2,3,4,1)
+            density_color = self.density_net(volume_feats).reshape(inputs.shape[0], -1)
             return density_color
 
     def forward_sdfnetwork_online(self, inputs):
         grid = self.mapping.meter2grid(inputs, True)
         grid = grid[None, None, ...] * 2 - 1  # 1, 1, n, 3
 
-        if self.config.tpv:
+        if self.config.representation == 'tpv':
             tpv_hw, tpv_zh, tpv_wz = self.density_color.split(
                 [self.h_size * self.w_size, self.z_size * self.h_size, self.w_size * self.z_size], dim=1
             )
@@ -629,7 +724,7 @@ class SDFCustomField(Field):
             tpv = tpv_hw + tpv_zh + tpv_wz
             density_color = self.density_net(tpv)
             return density_color[:, :1]
-        else:
+        elif self.config.representation == 'bev':
             bev = self.density_color
             bev = bev.unflatten(1, (self.h_size, self.w_size)).permute(0, 3, 1, 2)  # bs, c, h, w
             bev = (
@@ -647,12 +742,19 @@ class SDFCustomField(Field):
                 inputs.shape[0], -1
             )  # n, c
             return density_color
-
+    
     def forward_geonetwork(self, inputs):
         """forward the geonetwork"""
         if self.config.calculate_online:
             return self.forward_geonetwork_online(inputs)
-        return self.sample_something(inputs, self.density_color)
+        if self.density_color_bg is not None:
+            foreground_mask = (inputs[...,0]>self.aabb[0,0]) & (inputs[...,0]<self.aabb[1,0]) & (inputs[...,1]>self.aabb[0,1]) & (inputs[...,1]<self.aabb[1,1]) \
+                                & (inputs[...,2]>self.aabb[0,2]) & (inputs[...,2]<self.aabb[1,2])
+        else:
+            foreground_mask = torch.ones_like(inputs[...,0], dtype=bool)
+        foreground_output = self.sample_something(inputs[foreground_mask], self.volume_pad(self.density_color))
+        background_output = self.sample_something(inputs[~foreground_mask], self.density_color_bg) if (~foreground_mask).sum()>0 else None
+        return foreground_output, background_output, foreground_mask
 
     def forward_sdfnetwork(self, inputs):
         """forward the geonetwork"""
@@ -662,10 +764,11 @@ class SDFCustomField(Field):
 
     def sample_something(self, inputs, tensor):
         # tensor: bs, c, h, w, d
+        bs = tensor.size(0)
         grid = self.mapping.meter2grid(inputs, True)
 
         grid = 2 * grid - 1
-        grid = grid.reshape(1, -1, 1, 1, 3).to(tensor.dtype)
+        grid = grid.reshape(bs, -1, 1, 1, 3).to(tensor.dtype)
 
         sampled = cudagrid.grid_sample_3d(
             tensor, grid[..., [2, 1, 0]], align_corners=True, padding_mode="border"
@@ -757,7 +860,7 @@ class SDFCustomField(Field):
 
         inv_s = self.deviation_network.get_variance()  # Single parameter
 
-        true_cos = (ray_samples.frustums.directions * gradients).sum(-1, keepdim=True)
+        true_cos = (ray_samples.frustums.directions[...,0:sdf.shape[-2],:] * gradients).sum(-1, keepdim=True)
 
         # anneal as NeuS
         cos_anneal_ratio = self._cos_anneal_ratio
@@ -769,8 +872,8 @@ class SDFCustomField(Field):
         )  # always non-positive
 
         # Estimate signed distances at section points
-        estimated_next_sdf = sdf + iter_cos * ray_samples.deltas * 0.5
-        estimated_prev_sdf = sdf - iter_cos * ray_samples.deltas * 0.5
+        estimated_next_sdf = sdf + iter_cos * ray_samples.deltas[...,0:sdf.shape[-2],:] * 0.5
+        estimated_prev_sdf = sdf - iter_cos * ray_samples.deltas[...,0:sdf.shape[-2],:] * 0.5
 
         prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
         next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
@@ -1016,6 +1119,7 @@ class SDFCustomField(Field):
 
         inputs = ray_samples.frustums.get_start_positions()
         inputs = inputs.view(-1, 3)
+        frames_id = ray_samples.times.reshape(-1)
 
         directions = ray_samples.frustums.directions
         directions_flat = directions.reshape(-1, 3)
@@ -1024,10 +1128,34 @@ class SDFCustomField(Field):
             inputs = self.spatial_distortion(inputs)
         points_norm = inputs.norm(dim=-1)
         # compute gradient in constracted space
-        h = self.forward_geonetwork(inputs)
+        next_mask = frames_id==1
+        # import time
+        if self.config.estimate_flow and next_mask.sum()>0:
+            alpha = self.deviation_network.get_variance().detach()
+            # next_volume = self.density_color.clone()
+            next_density = alpha * (0.5 + 0.5 * self.density_color[:,0:1,...].sign() * torch.expm1(-self.density_color[:,0:1,...].abs() * alpha))
+            next_volume = torch.cat([next_density, self.density_color[:,1:,...]], dim=1).permute(0,4,1,2,3).flatten(0,1)
+            voxel_size = torch.FloatTensor([(self.aabb[1,0]-self.aabb[0,0])/(self.w_sdf-1), (self.aabb[1,1]-self.aabb[0,1])/(self.h_sdf-1)]).to(alpha.device)
+            scene_flow = self.fwd_flow.permute(0,4,1,2,3).flatten(0,1) / voxel_size[None,:,None,None]
+            # t1 = time.time()
+            next_volume = softsplat.softsplat(tenIn=next_volume, tenFlow=scene_flow, tenMetric=None, strMode='sum').reshape(-1, self.z_sdf, 1+self.color_dims, self.h_sdf, self.w_sdf).permute(0,2,3,4,1)
+            # t2 = time.time()
+            h = torch.zeros([inputs.shape[0], self.color_dims+1], dtype=alpha.dtype, device=alpha.device)
+            h[next_mask] = self.sample_something(inputs[next_mask], self.volume_pad(next_volume))
+            h[~next_mask] = self.sample_something(inputs[~next_mask], self.volume_pad(self.density_color))
+        else:
+            h = self.sample_something(inputs, self.volume_pad(self.density_color))
+        # h, h_bkgd, foreground_mask = self.forward_geonetwork(inputs)
         sdf, geo_feature = torch.split(h, [1, self.color_dims], dim=-1)
-
-        gradients = self.sample_something(inputs, self.gradients)  # n, 3
+        # if h_bkgd != None:
+        #     density, geo_feature_bkgd = torch.split(h_bkgd, [1, self.color_dims], dim=-1)
+        #     density = F.softplus(density)
+        #     geo_feature = torch.cat((geo_feature, geo_feature_bkgd), dim=0)
+        # gradients = self.sample_something(inputs[foreground_mask], self.volume_pad(self.gradients))  # n, 3
+        # t3 = time.time()
+        gradients = self.sample_something(inputs, self.volume_pad(self.gradients))
+        # t4 = time.time()
+        # print(t2-t1, t4-t3)
 
         rgb = self.get_colors(inputs, directions_flat, gradients, geo_feature[..., :3])
         rgb = rgb.view(*ray_samples.frustums.directions.shape[:-1], -1)
@@ -1035,8 +1163,8 @@ class SDFCustomField(Field):
             sem = geo_feature[..., 3:]
             sem = sem.softmax(dim=-1)
             sem = sem.view(*ray_samples.frustums.directions.shape[:-1], -1)
-        sdf = sdf.view(*ray_samples.frustums.directions.shape[:-1], -1)
-        gradients = gradients.view(*ray_samples.frustums.directions.shape[:-1], -1)
+        sdf = sdf.view(*ray_samples.frustums.directions.shape[:-2], -1, 1)
+        gradients = gradients.view(*ray_samples.frustums.directions.shape[:-2], -1, 3)
         normals = F.normalize(gradients, p=2, dim=-1)
         points_norm = points_norm.view(*ray_samples.frustums.directions.shape[:-1], -1)
 
@@ -1046,7 +1174,7 @@ class SDFCustomField(Field):
                 FieldHeadNames.SDF: sdf,
                 FieldHeadNames.NORMAL: normals,
                 FieldHeadNames.GRADIENT: torch.cat(
-                    [gradients.reshape(-1, 3), self.gradients.reshape(3, -1).transpose(0, 1)], dim=0
+                    [gradients.reshape(-1, 3), self.gradients.permute(0,2,3,4,1).reshape(-1,3)], dim=0
                 ),
                 "points_norm": points_norm,
             }
@@ -1056,7 +1184,14 @@ class SDFCustomField(Field):
 
         if return_alphas:
             # TODO use mid point sdf for NeuS
-            alphas = self.get_alpha(ray_samples, sdf, gradients)
+            next_ray_mask = ray_samples.times[:, 0, 0] == 1
+            alphas = torch.zeros_like(sdf, dtype=ray_samples.deltas.dtype)
+            alphas[~next_ray_mask] = self.get_alpha(ray_samples[~next_ray_mask], sdf[~next_ray_mask], gradients[~next_ray_mask])
+            if next_ray_mask.sum()>0:
+                alphas[next_ray_mask] = 1 - torch.exp(- ray_samples.deltas[next_ray_mask]* sdf[next_ray_mask])
+            # if h_bkgd != None:
+            #     alphas_bkgd = 1 - torch.exp(- ray_samples.deltas[...,sdf.shape[-2]:,:]* density.reshape(*ray_samples.frustums.directions.shape[:-2],-1,1))
+            #     alphas =  torch.cat((alphas, alphas_bkgd), dim=-2)
             outputs.update({FieldHeadNames.ALPHA: alphas})
 
         if return_occupancy:

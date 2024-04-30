@@ -25,6 +25,7 @@ import torch
 from nerfacc import OccupancyGrid
 from torch import nn
 from torchtyping import TensorType
+import copy
 
 from nerfstudio.cameras.rays import Frustums, RayBundle, RaySamples
 
@@ -906,12 +907,50 @@ class NeuSSampler(Sampler):
         # exit(-1)
         # TODO
         # sample more points outside surface
-        # if self.num_samples_outside > 0:
-        #   ray_samples_uniform = self.outside_sampler(ray_bundle, num_samples=self.num_samples_outside)
-        #     ray_samples, _ = self.merge_ray_samples(ray_bundle, ray_samples, ray_samples_uniform)
+        if self.num_samples_outside > 0:
+            ray_bundle_far = copy.deepcopy(ray_bundle)
+            ray_bundle_far.nears = ray_bundle.fars+0.1
+            ray_bundle_far.fars = 1e10 * torch.ones_like(ray_bundle.fars)
+            ray_samples_uniform = self.outside_sampler(ray_bundle_far, num_samples=self.num_samples_outside)
+            ray_samples, _ = self.merge_ray_samples(ray_bundle, ray_samples, ray_samples_uniform)
 
         return ray_samples
 
+    def merge_ray_samples(self, ray_bundle: RayBundle, ray_samples_1: RaySamples, ray_samples_2: RaySamples):
+        """Merge two set of ray samples and return sorted index which can be used to merge sdf values
+
+        Args:
+            ray_samples_1 : ray_samples to merge
+            ray_samples_2 : ray_samples to merge
+        """
+        starts_1_euc = ray_samples_1.frustums.starts[..., 0]  # bs, S
+        starts_2_euc = ray_samples_2.frustums.starts[..., 0]
+
+        ends_euc = torch.maximum(
+            ray_samples_1.frustums.ends[..., -1:, 0],  # bs, 1
+            ray_samples_2.frustums.ends[..., -1:, 0],
+        )  # bs, 1
+
+        bins_euc, sorted_index = torch.sort(torch.cat([starts_1_euc, starts_2_euc], -1), -1)
+
+        bins_euc = torch.cat([bins_euc, ends_euc], dim=-1)
+
+        # Stop gradients
+        bins_euc = bins_euc.detach()
+
+        # euclidean_bins = ray_samples_1.spacing_to_euclidean_fn(bins)
+        bins = (bins_euc - ray_bundle.nears) / (ray_bundle.fars - ray_bundle.nears + 1e-6)
+
+        ray_samples = ray_bundle.get_ray_samples(
+            bin_starts=bins_euc[..., :-1, None],
+            bin_ends=bins_euc[..., 1:, None],
+            spacing_starts=bins[..., :-1, None],
+            spacing_ends=bins[..., 1:, None],
+            spacing_to_euclidean_fn=ray_samples_1.spacing_to_euclidean_fn,
+        )
+
+        return ray_samples, sorted_index
+    
     def rendering_sdf_with_fixed_inv_s(self, ray_samples: RaySamples, sdf: torch.Tensor, inv_s):
         """rendering given a fixed inv_s as NeuS"""
         batch_size = ray_samples.shape[0]

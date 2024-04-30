@@ -66,8 +66,8 @@ def point_sampling(reference_points, img_metas):
             reference_points_cam[..., 2:3], torch.ones_like(reference_points_cam[..., 2:3]) * eps
         )
 
-    reference_points_cam[..., 0] /= img_metas[0]["img_shape"][0][1]
-    reference_points_cam[..., 1] /= img_metas[0]["img_shape"][0][0]
+    reference_points_cam[..., 0] /= img_metas[0]["img_shape"][1]
+    reference_points_cam[..., 1] /= img_metas[0]["img_shape"][0]
 
     tpv_mask = (
         tpv_mask
