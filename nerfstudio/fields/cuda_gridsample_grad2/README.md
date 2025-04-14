@@ -1,0 +1,1 @@
+This repository is modified from the original [cuda-gridsample-grad2](https://github.com/AliaksandrSiarohin/cuda-gridsample-grad2).

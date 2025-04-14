@@ -1,1 +1,1 @@
-This repository is modified from the original [sdfstudio](https://github.com/autonomousvision/sdfstudio).
+This repository provides the interface to render from occupancy and occupancy flow field as described in [Let Occ Flow: Self-Supervised 3D Occupancy Flow Prediction](https://arxiv.org/pdf/2407.07587), which is modified from the original [sdfstudio](https://github.com/autonomousvision/sdfstudio).

@@ -22,7 +22,7 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import nerfacc
 import torch
-from nerfacc import OccupancyGrid
+# from nerfacc import OccupancyGrid
 from torch import nn
 from torchtyping import TensorType
 import copy
@@ -383,14 +383,14 @@ class VolumetricSampler(Sampler):
 
     def __init__(
         self,
-        occupancy_grid: Optional[OccupancyGrid] = None,
+        # occupancy_grid: Optional[OccupancyGrid] = None,
         density_fn: Optional[Callable[[TensorType[..., 3]], TensorType[..., 1]]] = None,
         scene_aabb: Optional[TensorType[2, 3]] = None,
     ) -> None:
         super().__init__()
         self.scene_aabb = scene_aabb
         self.density_fn = density_fn
-        self.occupancy_grid = occupancy_grid
+        # self.occupancy_grid = occupancy_grid
         if self.scene_aabb is not None:
             self.scene_aabb = self.scene_aabb.to("cuda").flatten()
         print(self.scene_aabb)
@@ -1311,7 +1311,7 @@ class NeuralReconWSampler(Sampler):
         # for merge samples
         self.unisurf_sampler = UniSurfSampler()
 
-        self.grid = nerfacc.OccupancyGrid(aabb.reshape(-1), resolution=self.coarse_resolution)
+        # self.grid = nerfacc.OccupancyGrid(aabb.reshape(-1), resolution=self.coarse_resolution)
         self._binary = coarse_binary_grid.reshape(
             self.coarse_resolution, self.coarse_resolution, self.coarse_resolution
         ).contiguous()
@@ -1478,7 +1478,7 @@ class NeuSAccSampler(Sampler):
         # nesu_sampler at the begining of training
         self.neus_sampler = neus_sampler
 
-        self.grid = nerfacc.OccupancyGrid(aabb.reshape(-1), resolution=self.resolution)
+        # self.grid = nerfacc.OccupancyGrid(aabb.reshape(-1), resolution=self.resolution)
         self.register_buffer("_binary", torch.ones((self.grid_size, self.grid_size, self.grid_size), dtype=torch.bool))
         self.register_buffer("_update_counter", torch.zeros(1, dtype=torch.int32))
 

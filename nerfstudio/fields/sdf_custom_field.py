@@ -54,99 +54,6 @@ from .mappings import GridMeterMapping
 from .sh_render import SHRender
 from .utils import sample_from_2d_img_feats
 from mmcv.cnn.bricks.conv_module import ConvModule
-# class GridMeterMapping:
-#     def __init__(
-#         self,
-#         bev_inner=128,
-#         bev_outer=32,
-#         range_inner=51.2,
-#         range_outer=51.2,
-#         nonlinear_mode="linear_upscale",
-#         z_inner=20,
-#         z_outer=10,
-#         z_ranges=[-5.0, 3.0, 11.0],
-#     ) -> None:
-#         self.bev_inner = bev_inner
-#         self.bev_outer = bev_outer
-#         self.range_inner = range_inner
-#         self.range_outer = range_outer
-#         assert nonlinear_mode == "linear_upscale"  # TODO
-#         self.nonlinear_mode = nonlinear_mode
-#         self.z_inner = z_inner
-#         self.z_outer = z_outer
-#         self.z_ranges = z_ranges
-
-#         self.hw_unit = range_inner * 1.0 / bev_inner
-#         self.increase_unit = (range_outer - bev_outer * self.hw_unit) * 2.0 / bev_outer / (bev_outer + 1)
-
-#         self.z_unit = (z_ranges[1] - z_ranges[0]) * 1.0 / z_inner
-#         self.z_increase_unit = (z_ranges[2] - z_ranges[1] - z_outer * self.z_unit) * 2.0 / z_outer / (z_outer + 1)
-
-#     def grid2meter(self, grid):
-#         hw = grid[..., :2]
-#         hw_center = hw - (self.bev_inner + self.bev_outer)
-#         hw_center_abs = torch.abs(hw_center)
-#         yx_base_abs = hw_center_abs * self.hw_unit
-#         hw_outer = torch.relu(hw_center_abs - self.bev_inner)
-#         hw_outer_int = torch.floor(hw_outer)
-#         yx_outer_base = hw_outer_int * (hw_outer_int + 1) / 2.0 * self.increase_unit
-#         yx_outer_resi = (hw_outer - hw_outer_int) * (hw_outer_int + 1) * self.increase_unit
-#         yx_abs = yx_base_abs + yx_outer_base + yx_outer_resi
-#         yx = torch.sign(hw_center) * yx_abs
-
-#         if grid.shape[-1] == 3:
-#             d = grid[..., 2:3]
-#             d_center = d
-#             z_base = d_center * self.z_unit
-
-#             d_outer = torch.relu(d_center - self.z_inner)
-#             d_outer_int = torch.floor(d_outer)
-#             z_outer_base = d_outer_int * (d_outer_int + 1) / 2.0 * self.z_increase_unit
-#             z_outer_resi = (d_outer - d_outer_int) * (d_outer_int + 1) * self.z_increase_unit
-#             z = z_base + z_outer_base + z_outer_resi + self.z_ranges[0]
-
-#             return torch.cat([yx[..., 1:2], yx[..., 0:1], z], dim=-1)
-#         else:
-#             return yx[..., [1, 0]]
-
-#     def meter2grid(self, meter):
-#         xy = meter[..., :2]
-#         xy_abs = torch.abs(xy)
-#         wh_base_abs = xy_abs / self.hw_unit
-#         wh_base_abs = wh_base_abs.clamp_(max=self.bev_inner)
-#         xy_outer_abs = torch.relu(xy_abs - self.range_inner)
-
-#         wh_outer_base = torch.sqrt(
-#             (1.0 / 2 + self.hw_unit / self.increase_unit) ** 2 + 2 * xy_outer_abs / self.increase_unit
-#         ) - (1.0 / 2 + self.hw_unit / self.increase_unit)
-#         wh_outer_base = torch.floor(wh_outer_base)
-#         xy_outer_resi = (
-#             xy_outer_abs - wh_outer_base * self.hw_unit - self.increase_unit * wh_outer_base * (wh_outer_base + 1) / 2
-#         )
-#         wh_outer_resi = xy_outer_resi / (self.hw_unit + (wh_outer_base + 1) * self.increase_unit)
-#         wh_center_abs = wh_base_abs + wh_outer_base + wh_outer_resi
-#         wh_center = torch.sign(xy) * wh_center_abs
-#         wh = wh_center + self.bev_inner + self.bev_outer
-
-#         z = meter[..., 2:3]
-#         z_abs = z - self.z_ranges[0]
-#         d_base = z_abs / self.z_unit
-#         d_base = d_base.clamp_(max=self.z_inner)
-#         z_outer = torch.relu(z_abs - (self.z_ranges[1] - self.z_ranges[0]))
-
-#         d_outer_base = torch.sqrt(
-#             (1.0 / 2 + self.z_unit / self.z_increase_unit) ** 2 + 2 * z_outer / self.z_increase_unit
-#         ) - (1.0 / 2 + self.z_unit / self.z_increase_unit)
-#         d_outer_base = torch.floor(d_outer_base)
-#         z_outer_resi = (
-#             z_outer - d_outer_base * self.z_unit - self.z_increase_unit * d_outer_base * (d_outer_base + 1) / 2
-#         )
-#         d_outer_resi = z_outer_resi / (self.z_unit + (d_outer_base + 1) * self.z_increase_unit)
-#         d = d_base + d_outer_base + d_outer_resi
-
-#         return torch.cat([wh[..., 1:2], wh[..., 0:1], d], dim=-1)
-
-
 class LaplaceDensity(nn.Module):  # alpha * Laplace(loc=0, scale=beta).cdf(-sdf)
     """Laplace density from VolSDF"""
 
@@ -330,6 +237,7 @@ class SDFCustomFieldConfig(FieldConfig):
     estimate_flow: bool = False
 
     return_sem: bool = False
+    with_sem_free: bool = False
 
 
 class SDFCustomField(Field):
@@ -408,12 +316,12 @@ class SDFCustomField(Field):
         density_net = nn.Sequential(*density_net)
         self.density_net = density_net
         
-        background_net = []
-        for i in range(self.density_layers - 1):
-            background_net.extend([nn.Softplus(), nn.Linear(self.embed_dims, self.embed_dims)])
-        background_net.extend([nn.Softplus(), nn.Linear(self.embed_dims, 1 + self.color_dims)])
-        background_net = nn.Sequential(*background_net)
-        self.background_net = background_net
+        # background_net = []
+        # for i in range(self.density_layers - 1):
+        #     background_net.extend([nn.Softplus(), nn.Linear(self.embed_dims, self.embed_dims)])
+        # background_net.extend([nn.Softplus(), nn.Linear(self.embed_dims, 1 + self.color_dims)])
+        # background_net = nn.Sequential(*background_net)
+        # self.background_net = background_net
         
         self.conv = ConvModule(self.feat_dims ,self.embed_dims,kernel_size=1,stride=1,padding=1,bias=False,conv_cfg=dict(type='Conv2d'),
                                 norm_cfg=dict(type='BN', ), act_cfg=dict(type='ReLU',inplace=True))
@@ -545,6 +453,7 @@ class SDFCustomField(Field):
                 real_size = torch.FloatTensor([volume_z, volume_w, volume_h]).to(device)
                 verts_norm = vertices * real_size/(real_size-1)
                 tpv = cudagrid.grid_sample_3d(tpv.permute(0,4,1,2,3), verts_norm[None,...].repeat(bs,1,1,1,1), padding_mode='border', align_corners=True).permute(0,2,3,4,1)
+            self.voxel_feats = tpv
             ## TODO: temporarily using addition to fuse
             if self.config.using_2d_img_feats:
                 tpv = tpv + img_feats_3d
@@ -747,14 +656,8 @@ class SDFCustomField(Field):
         """forward the geonetwork"""
         if self.config.calculate_online:
             return self.forward_geonetwork_online(inputs)
-        if self.density_color_bg is not None:
-            foreground_mask = (inputs[...,0]>self.aabb[0,0]) & (inputs[...,0]<self.aabb[1,0]) & (inputs[...,1]>self.aabb[0,1]) & (inputs[...,1]<self.aabb[1,1]) \
-                                & (inputs[...,2]>self.aabb[0,2]) & (inputs[...,2]<self.aabb[1,2])
-        else:
-            foreground_mask = torch.ones_like(inputs[...,0], dtype=bool)
-        foreground_output = self.sample_something(inputs[foreground_mask], self.volume_pad(self.density_color))
-        background_output = self.sample_something(inputs[~foreground_mask], self.density_color_bg) if (~foreground_mask).sum()>0 else None
-        return foreground_output, background_output, foreground_mask
+        foreground_output = self.sample_something(inputs, self.volume_pad(self.density_color))
+        return foreground_output
 
     def forward_sdfnetwork(self, inputs):
         """forward the geonetwork"""
@@ -762,17 +665,21 @@ class SDFCustomField(Field):
             return self.forward_sdfnetwork_online(inputs)
         return self.sample_something(inputs, self.density_color[:, :1, ...])
 
-    def sample_something(self, inputs, tensor):
+    def sample_something(self, inputs, tensor, nearest=False, padding_mode='border'):
         # tensor: bs, c, h, w, d
         bs = tensor.size(0)
         grid = self.mapping.meter2grid(inputs, True)
 
         grid = 2 * grid - 1
         grid = grid.reshape(bs, -1, 1, 1, 3).to(tensor.dtype)
-
-        sampled = cudagrid.grid_sample_3d(
-            tensor, grid[..., [2, 1, 0]], align_corners=True, padding_mode="border"
-        )  # bs, c, n, 1, 1
+        if not nearest:
+            sampled = cudagrid.grid_sample_3d(
+                tensor, grid[..., [2, 1, 0]], align_corners=True, padding_mode=padding_mode
+            )  # bs, c, n, 1, 1
+        else:
+            sampled = torch.nn.functional.grid_sample(
+                tensor, grid[..., [2, 1, 0]], mode='nearest', align_corners=True, padding_mode=padding_mode
+            )  # bs, c, n, 1, 1
 
         sampled = sampled.permute(0, 2, 3, 4, 1).flatten(0, 3)  # bs*n, c
         return sampled
@@ -1160,8 +1067,12 @@ class SDFCustomField(Field):
         rgb = self.get_colors(inputs, directions_flat, gradients, geo_feature[..., :3])
         rgb = rgb.view(*ray_samples.frustums.directions.shape[:-1], -1)
         if self.config.return_sem:
-            sem = geo_feature[..., 3:]
-            sem = sem.softmax(dim=-1)
+            alpha = self.deviation_network.get_variance().detach()
+            if self.config.with_sem_free:
+                sem = torch.cat((geo_feature, -alpha * sdf), dim=-1)
+            else:
+                sem = geo_feature
+            # sem = sem.softmax(dim=-1)
             sem = sem.view(*ray_samples.frustums.directions.shape[:-1], -1)
         sdf = sdf.view(*ray_samples.frustums.directions.shape[:-2], -1, 1)
         gradients = gradients.view(*ray_samples.frustums.directions.shape[:-2], -1, 3)
